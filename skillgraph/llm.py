@@ -34,7 +34,7 @@ def call_llm(
     system: str = "",
     model: str = "",
     temperature: float = 0.3,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
     retries: int = 2,
 ) -> LLMResponse:
     """Call an LLM and return structured response."""
@@ -62,10 +62,12 @@ def call_llm(
                 )
             return resp
         except Exception as e:
+            context_hint = " [likely context-length/input-token-limit issue]" if _is_context_length_error(e) else ""
             logger.warning(
-                "LLM call failed (attempt %d/%d): %s",
+                "LLM call failed (attempt %d/%d)%s: %s",
                 attempt + 1,
                 retries + 1,
+                context_hint,
                 e,
             )
             if attempt < retries:
@@ -80,14 +82,29 @@ def call_llm_json(
     system: str = "",
     model: str = "",
     temperature: float = 0.2,
+    retries: int = 2,
 ) -> tuple[dict | list, float]:
-    """Call LLM and return parsed JSON + cost. Raises on parse failure."""
-    resp = call_llm(prompt, system=system, model=model, temperature=temperature)
-    if resp.data is None:
-        raise ValueError(
-            f"Failed to extract JSON from LLM response:\n{resp.text[:500]}"
-        )
-    return resp.data, resp.cost
+    """Call LLM and return parsed JSON + cost. Retries with the same prompt on failure."""
+    total_cost = 0.0
+    last_text = ""
+
+    for attempt in range(retries + 1):
+        resp = call_llm(prompt, system=system, model=model, temperature=temperature)
+        total_cost += resp.cost
+        last_text = resp.text
+        if resp.data is not None:
+            return resp.data, total_cost
+
+        if attempt < retries:
+            logger.warning(
+                "JSON extraction failed (attempt %d/%d), retrying with the same prompt",
+                attempt + 1, retries + 1,
+            )
+        else:
+            raise ValueError(
+                f"Failed to extract JSON after {retries + 1} attempts. "
+                f"Last response:\n{last_text[:500]}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -179,21 +196,41 @@ def _extract_json(text: str) -> dict | list | None:
         except json.JSONDecodeError:
             pass
 
-    # Try bare JSON (find first { or [)
+    # Try bare JSON (find { or [, with string-aware depth tracking)
     for start_char, end_char in [("{", "}"), ("[", "]")]:
         start = text.find(start_char)
-        if start == -1:
-            continue
-        depth = 0
-        for i in range(start, len(text)):
-            if text[i] == start_char:
-                depth += 1
-            elif text[i] == end_char:
-                depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start : i + 1])
-                except json.JSONDecodeError:
+        while start != -1:
+            depth = 0
+            in_string = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if ch == '"' and (i == 0 or text[i - 1] != '\\'):
+                    in_string = not in_string
+                if in_string:
+                    continue
+                if ch == start_char:
+                    depth += 1
+                elif ch == end_char:
+                    depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except json.JSONDecodeError:
+                        pass
                     break
+            # Try next occurrence of start_char
+            start = text.find(start_char, start + 1)
 
     return None
+def _is_context_length_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    patterns = (
+        "context_length_exceeded",
+        "maximum context length",
+        "maximum input tokens",
+        "input token limit",
+        "too many tokens",
+        "prompt is too long",
+        "requested tokens",
+    )
+    return any(pattern in text for pattern in patterns)

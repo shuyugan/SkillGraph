@@ -13,7 +13,3 @@ CACHE_DIR = DATA_DIR / "cache"
 
 # ── LLM ──
 MODEL = "gpt-5.2"
-
-# ── Pipeline parameters ──
-MAX_LINKS_PER_NODE = 5
-NODE_LINE_RANGE = (20, 40)
